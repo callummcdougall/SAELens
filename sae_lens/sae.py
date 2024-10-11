@@ -12,10 +12,6 @@ T = TypeVar("T", bound="SAE")
 import einops
 import torch
 from jaxtyping import Float
-from safetensors.torch import save_file
-from torch import nn
-from transformer_lens.hook_points import HookedRootModule, HookPoint
-
 from sae_lens.config import DTYPE_MAP
 from sae_lens.toolkit.pretrained_sae_loaders import (
     NAMED_PRETRAINED_SAE_LOADERS,
@@ -26,6 +22,9 @@ from sae_lens.toolkit.pretrained_saes_directory import (
     get_norm_scaling_factor,
     get_pretrained_saes_directory,
 )
+from safetensors.torch import save_file
+from torch import nn
+from transformer_lens.hook_points import HookedRootModule, HookPoint
 
 SPARSITY_PATH = "sparsity.safetensors"
 SAE_WEIGHTS_PATH = "sae_weights.safetensors"
@@ -63,9 +62,11 @@ class SAEConfig:
     neuronpedia_id: Optional[str] = None
     model_from_pretrained_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    # todo, make non-default?
+    use_b_dec_out: bool = False
+
     @classmethod
     def from_dict(cls, config_dict: dict[str, Any]) -> "SAEConfig":
-
         # rename dict:
         rename_dict = {  # old : new
             "hook_point": "hook_name",
@@ -160,6 +161,12 @@ class SAE(HookedRootModule):
         else:
             raise (ValueError)
 
+        # b_dec_out might be used
+        if self.cfg.use_b_dec_out:
+            self.b_dec_out = nn.Parameter(
+                torch.zeros(self.cfg.d_in, dtype=self.dtype, device=self.device)
+            )
+
         # handle presence / absence of scaling factor.
         if self.cfg.finetuning_scaling_factor:
             self.apply_finetuning_scaling_factor = (
@@ -189,7 +196,6 @@ class SAE(HookedRootModule):
 
         # handle run time activation normalization if needed:
         if self.cfg.normalize_activations == "constant_norm_rescale":
-
             #  we need to scale the norm of the input and store the scaling factor
             def run_time_activation_norm_fn_in(x: torch.Tensor) -> torch.Tensor:
                 self.x_norm_coeff = (self.cfg.d_in**0.5) / x.norm(dim=-1, keepdim=True)
@@ -205,7 +211,6 @@ class SAE(HookedRootModule):
             self.run_time_activation_norm_fn_out = run_time_activation_norm_fn_out
 
         elif self.cfg.normalize_activations == "layer_norm":
-
             #  we need to scale the norm of the input and store the scaling factor
             def run_time_activation_ln_in(
                 x: torch.Tensor, eps: float = 1e-5
@@ -230,7 +235,6 @@ class SAE(HookedRootModule):
         self.setup()  # Required for `HookedRootModule`s
 
     def initialize_weights_basic(self):
-
         # no config changes encoder bias init for now.
         self.b_enc = nn.Parameter(
             torch.zeros(self.cfg.d_sae, dtype=self.dtype, device=self.device)
@@ -414,7 +418,7 @@ class SAE(HookedRootModule):
                 feature_acts = self.activation_fn(hidden_pre)
                 x_reconstruct_clean = self.reshape_fn_out(
                     self.apply_finetuning_scaling_factor(feature_acts) @ self.W_dec
-                    + self.b_dec,
+                    + (self.b_dec_out if self.cfg.use_b_dec_out else self.b_dec),
                     d_head=self.d_head,
                 )
 
@@ -448,7 +452,7 @@ class SAE(HookedRootModule):
                 x_reconstruct_clean = self.reshape_fn_out(
                     self.apply_finetuning_scaling_factor(feature_acts_clean)
                     @ self.W_dec
-                    + self.b_dec,
+                    + (self.b_dec_out if self.cfg.use_b_dec_out else self.b_dec),
                     d_head=self.d_head,
                 )
 
@@ -474,7 +478,7 @@ class SAE(HookedRootModule):
                 )
                 x_reconstruct_clean = self.reshape_fn_out(
                     self.apply_finetuning_scaling_factor(feature_acts) @ self.W_dec
-                    + self.b_dec,
+                    + (self.b_dec_out if self.cfg.use_b_dec_out else self.b_dec),
                     d_head=self.d_head,  # TODO(conmy): d_head?! Eh?
                 )
                 sae_error = self.hook_sae_error(x - x_reconstruct_clean)
@@ -487,7 +491,6 @@ class SAE(HookedRootModule):
     def encode_gated(
         self, x: Float[torch.Tensor, "... d_in"]
     ) -> Float[torch.Tensor, "... d_sae"]:
-
         x = x.to(self.dtype)
         x = self.reshape_fn_in(x)
         x = self.hook_sae_input(x)
@@ -563,7 +566,8 @@ class SAE(HookedRootModule):
         """Decodes SAE feature activation tensor into a reconstructed input activation tensor."""
         # "... d_sae, d_sae d_in -> ... d_in",
         sae_out = self.hook_sae_recons(
-            self.apply_finetuning_scaling_factor(feature_acts) @ self.W_dec + self.b_dec
+            self.apply_finetuning_scaling_factor(feature_acts) @ self.W_dec
+            + (self.b_dec_out if self.cfg.use_b_dec_out else self.b_dec)
         )
 
         # handle run time activation normalization if needed
@@ -599,7 +603,6 @@ class SAE(HookedRootModule):
         self.cfg.normalize_activations = "none"
 
     def save_model(self, path: str, sparsity: Optional[torch.Tensor] = None):
-
         if not os.path.exists(path):
             os.mkdir(path)
 
@@ -620,7 +623,6 @@ class SAE(HookedRootModule):
     def load_from_pretrained(
         cls, path: str, device: str = "cpu", dtype: str | None = None
     ) -> "SAE":
-
         # get the config
         config_path = os.path.join(path, SAE_CFG_PATH)
         with open(config_path, "r") as f:
@@ -753,7 +755,6 @@ class SAE(HookedRootModule):
         return cls(SAEConfig.from_dict(config_dict))
 
     def turn_on_forward_pass_hook_z_reshaping(self):
-
         assert self.cfg.hook_name.endswith(
             "_z"
         ), "This method should only be called for hook_z SAEs."
